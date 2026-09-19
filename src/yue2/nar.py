@@ -209,6 +209,7 @@ def _offload_ar(model, enabled):
     for layer in model.model.layers:
         modules.extend((layer.input_layernorm, layer.self_attn, layer.post_attention_layernorm, layer.mlp))
     moved = []
+    mps_offloaded = False
     try:
         if enabled:
             for module in modules:
@@ -216,12 +217,22 @@ def _offload_ar(model, enabled):
                 if device.type != "cpu":
                     module.to(device="cpu")
                     moved.append((module, device))
+                    mps_offloaded = mps_offloaded or device.type == "mps"
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            elif mps_offloaded:
+                # Moving modules to CPU releases their live MPS storage, but the
+                # allocator otherwise retains cached blocks through the NAR solve.
+                # Return those blocks before the large acoustic attention tensors
+                # are created; this mirrors the CUDA cache release above without
+                # changing the generated values.
+                torch.mps.empty_cache()
         yield
     finally:
         for module, device in moved:
             module.to(device=device)
+        if mps_offloaded:
+            torch.mps.empty_cache()
 
 
 @torch.inference_mode()
