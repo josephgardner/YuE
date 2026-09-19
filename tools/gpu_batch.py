@@ -6,7 +6,8 @@ Workflow:
      ABC files referenced by `abc_path`);
   2. use an existing instance (--instance) or create one (--create, with a
      price confirmation);
-  3. clone/update the repo and bootstrap it with tools/gpu_deploy.sh;
+  3. clone/update the repo and bootstrap it with tools/gpu_deploy.sh
+     (certified environment only; --image assumes the runtime is baked in);
   4. upload the pack and run `yue2 batch` on the instance;
   5. download runs/batch locally;
   6. terminate the instance if it was created here (or with --terminate).
@@ -14,17 +15,24 @@ Workflow:
 Examples:
   tools/gpu_batch.py --request examples/song.json --seeds 4 --create
   tools/gpu_batch.py --request song-packs/my-song --seeds 4 --instance gpu-abc123
+  tools/gpu_batch.py --request examples/song.json --seeds 4 --create --image ghcr.io/you/yue2:0.1
   tools/gpu_batch.py --request examples/song.json --seeds 4 --create --dry-run
+
+Creation uses the REST API (POST /v1/instances) so `auto_terminate_hours` — a
+server-side backstop that fires even if this script dies — can be set. That
+flag is not yet in the released `gpu` CLI.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -33,6 +41,9 @@ from expand_seeds import build_manifest  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPO = "https://github.com/josephgardner/YuE.git"
 DEFAULT_ENVIRONMENT = "certified:pytorch@2.11"
+DEFAULT_AUTO_TERMINATE_HOURS = 2
+API_BASE = os.environ.get("GPUAI_API_BASE", "https://api.gpu.ai/v1")
+ENV_FILE = ROOT / ".env"
 
 
 def log(message):
@@ -118,38 +129,104 @@ def resolve_ssh_key(explicit):
     return preferred[0]["id"]
 
 
-def confirm_create(gpu_type, tier, environment, ssh_key_id, *, dry_run=False):
+def load_api_key():
+    key = os.environ.get("GPUAI_API_KEY")
+    if not key and ENV_FILE.is_file():
+        for line in ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("GPUAI_API_KEY="):
+                key = line.split("=", 1)[1].strip().strip('"').strip("'")
+                break
+    if not key:
+        raise SystemExit("GPUAI_API_KEY not set (export it or add it to .env); "
+                         "needed for the REST create path")
+    return key
+
+
+def api_request(method, path, body=None):
+    import urllib.error
+    import urllib.request
+
+    url = API_BASE.rstrip("/") + path
+    data = json.dumps(body).encode() if body is not None else None
+    request = urllib.request.Request(url, data=data, method=method)
+    request.add_header("Authorization", f"Bearer {load_api_key()}")
+    if data is not None:
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            raw = response.read().decode()
+            return response.status, response.headers, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise SystemExit(f"{method} {url} -> {exc.code}: {detail}")
+
+
+def poll_operation(op_id, *, timeout=900):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        _, _, operation = api_request("GET", f"/operations/{op_id}")
+        operation = operation or {}
+        state = operation.get("state")
+        if state == "succeeded":
+            return operation
+        if state in {"failed", "cancelled"}:
+            raise SystemExit(f"operation {op_id} {state}: {operation.get('error')}")
+        time.sleep(5)
+    raise SystemExit(f"operation {op_id} did not finish within {timeout}s")
+
+
+def create_instance(gpu_type, tier, environment, image, auto_terminate_hours,
+                    ssh_key_id, name, *, dry_run=False):
+    if image and environment:
+        raise SystemExit("pass --image or --environment, not both")
     prices = gpu_json(["pricing", "--gpu-type", gpu_type]) or []
     candidates = [p for p in prices if p.get("available") and p.get("tier") == tier]
     if not candidates and not dry_run:
         raise SystemExit(f"no available {gpu_type} capacity on {tier}")
     if candidates:
         cheapest = min(candidates, key=lambda p: p["price_per_hour"])
+        log(f"cheapest {gpu_type} ({tier}): ${cheapest['price_per_hour']:.4f}/hr "
+            f"in {cheapest.get('region')}")
         price = cheapest["price_per_hour"]
-        log(f"cheapest {gpu_type} ({tier}): ${price:.4f}/hr in {cheapest.get('region')}")
     else:
         price = 0.0
 
-    cmd = [
-        "gpu", "instances", "create",
-        "--type", gpu_type,
-        "--environment", environment,
-        "--count", "1",
-        "--tier", tier,
-        "--ssh-key-id", ssh_key_id,
-        "--name", "yue2-batch",
-    ]
-    print("will run:\n  " + " ".join(cmd) + f"\n  at ~${price:.4f}/hr")
+    body = {"gpu_type": gpu_type, "gpu_count": 1, "tier": tier, "name": name}
+    if image:
+        body["image"] = image
+    else:
+        body["environment"] = environment
+    if ssh_key_id:
+        body["ssh_key_ids"] = [ssh_key_id]
+    if auto_terminate_hours:
+        body["auto_terminate_hours"] = auto_terminate_hours
+
+    print("will POST /instances:\n  " + json.dumps(body) + f"\n  at ~${price:.4f}/hr")
     if dry_run:
         return "gpu-dryrun"
     reply = input("create this billed instance? type 'yes' to continue: ").strip().lower()
     if reply != "yes":
         raise SystemExit("aborted")
-    out = run(["gpu", "instances", "create", *cmd[3:], "-o", "json"], capture=True)
-    data = json.loads(out)
-    iid = data.get("id") or data.get("resource_id") or (data.get("instance") or {}).get("id")
+
+    _, headers, payload = api_request("POST", "/instances", body)
+    op_id = headers.get("Operation-Id") or headers.get("operation-id")
+    if op_id:
+        log(f"operation {op_id} submitted; waiting for the instance to boot")
+        operation = poll_operation(op_id)
+        iid = operation.get("resource_id")
+        if not iid:
+            result = operation.get("result") or {}
+            iid = result.get("id") if isinstance(result, dict) else None
+    else:
+        iid = (payload or {}).get("id") if isinstance(payload, dict) else None
     if not iid:
-        raise SystemExit(f"could not parse instance id from create output: {data}")
+        active = [i for i in (gpu_json_soft(["instances", "list"]) or [])
+                  if i.get("status") not in {"terminated", "deleting"}]
+        if len(active) == 1:
+            iid = active[0]["id"]
+    if not iid:
+        raise SystemExit(f"could not determine instance id from create response: {payload}")
     return iid
 
 
@@ -191,7 +268,12 @@ def main(argv=None):
     ap.add_argument("--instance", help="existing GPU.ai instance id")
     ap.add_argument("--create", action="store_true", help="create a new instance (billed)")
     ap.add_argument("--gpu-type", default="rtx_a6000")
-    ap.add_argument("--environment", default=DEFAULT_ENVIRONMENT)
+    ap.add_argument("--environment", default=DEFAULT_ENVIRONMENT,
+                    help="certified environment (mutually exclusive with --image)")
+    ap.add_argument("--image", help="custom container image (mutually exclusive with --environment)")
+    ap.add_argument("--auto-terminate-hours", type=int, default=DEFAULT_AUTO_TERMINATE_HOURS,
+                    help="server-side auto-terminate backstop in hours (0 = no limit)")
+    ap.add_argument("--name", default="yue2-batch")
     ap.add_argument("--tier", default="on_demand", choices=("on_demand", "spot"))
     ap.add_argument("--ssh-key-id")
     ap.add_argument("--keep", action="store_true", help="do not terminate the instance")
@@ -206,6 +288,8 @@ def main(argv=None):
         raise SystemExit("pass --instance or --create, not both")
     if not args.instance and not args.create:
         raise SystemExit("pass --instance <id> or --create")
+    if args.image and args.environment != DEFAULT_ENVIRONMENT:
+        raise SystemExit("pass --image or --environment, not both")
 
     report_spend_limit()
 
@@ -220,14 +304,21 @@ def main(argv=None):
         iid = args.instance
     else:
         ssh_key = args.ssh_key_id or resolve_ssh_key(None)
-        iid = confirm_create(args.gpu_type, args.tier, args.environment, ssh_key, dry_run=args.dry_run)
+        environment = None if args.image else args.environment
+        iid = create_instance(args.gpu_type, args.tier, environment, args.image,
+                              args.auto_terminate_hours, ssh_key, args.name,
+                              dry_run=args.dry_run)
         created = True
     log(f"instance {iid}")
 
     try:
-        log("deploying repo + bootstrap")
-        run(["bash", str(ROOT / "tools" / "gpu_deploy.sh"), iid, "--repo", args.repo,
-             "--dir", args.remote_dir], dry_run=args.dry_run)
+        if args.image:
+            log(f"custom image: assuming YuE2 is already at {args.remote_dir} "
+                f"(skipping clone/bootstrap)")
+        else:
+            log("deploying repo + bootstrap")
+            run(["bash", str(ROOT / "tools" / "gpu_deploy.sh"), iid, "--repo", args.repo,
+                 "--dir", args.remote_dir], dry_run=args.dry_run)
 
         remote_pack = f"{args.remote_dir}/packs/{slug}"
         log(f"uploading pack to {remote_pack}")

@@ -87,20 +87,44 @@ gpu instances list -o json          # verify nothing is still running
 
 ## Guardrails
 
-GPUs bill until terminated, and a crashed script does not stop the meter.
-`gpu_batch.py` prints the current spending limit up front and re-lists
-instances at the end (and on failure), reporting anything still running, but
-the durable backstop lives on the server:
+GPUs bill until terminated, and a crashed script does not stop the meter. Three
+independent layers cover this:
+
+1. **Server-side auto-terminate.** `gpu_batch.py` creates instances through the
+   REST API (`POST /v1/instances`) with `auto_terminate_hours` (default 2; set
+   `--auto-terminate-hours`). The countdown starts when the instance reaches
+   `running`, and the platform terminates it even if your Mac or this process
+   disappears. Creation uses REST rather than `gpu instances create` precisely
+   because the released CLI (v1.3) does not expose the flag.
+2. **Script teardown.** Instances created by the script are deleted at the end
+   unless `--keep` is passed; on failure the script prints the exact `delete`
+   command and leaves the instance up for debugging.
+3. **Spending limits.** A durable outer bound that applies to everything:
 
 ```bash
 gpu spend-limit --monthly 50 --daily 10    # requires org-admin
 gpu spend-limit -o json                    # show limit and month/day spend
 ```
 
-The daily cap is what saves you from an orphaned instance during an unattended
-run; the monthly limit is the outer bound. `--auto-terminate-hours` on
-`gpu instances create` would be the ideal per-run backstop, but it is not in
-the current CLI release (see Notes).
+`gpu_batch.py` prints the spending-limit state up front and re-lists instances
+at the end (and on failure), reporting anything still running.
+
+## Custom images (optional)
+
+The REST API accepts `image` as an alternative to `environment` — GPU.ai
+verifies and digest-pins it before provisioning. Pass it with `--image`:
+
+```bash
+tools/gpu_batch.py --request examples/song.json --seeds 4 --create \
+  --image ghcr.io/you/yue2-renderer:0.1
+```
+
+With `--image` the script assumes YuE2 is already installed at `--remote-dir`
+(default `/root/YuE2`) and skips clone/bootstrap. Images must be publicly
+pullable, `linux/amd64`, and on-demand only. GPU.ai publishes no image-size
+limit or pull-time guarantee, so start with a **thin image** (CUDA + Python +
+YuE2 + deps, no weights) and let the ~7.3 GB of weights download per instance;
+only bake weights in if measured cold starts show host-side layer reuse.
 
 ## Notes
 
@@ -110,8 +134,7 @@ the current CLI release (see Notes).
   `pip install .` path when exact 2.10 reproducibility matters.
 - Model weights (~7.3 GB) download to `$HF_HOME` (`.hf-cache/`) on first
   generation. They do not survive instance deletion.
-- GPU.ai's docs describe `--image` (bring your own container), `--env`,
-  `--port`, and `--auto-terminate-hours` on `gpu instances create`, but the
-  current CLI release (v1.3, also the Homebrew stable) does not implement them.
-  Until that ships, the certified PyTorch environment is the reproducible path,
-  and spend limits are the only server-side backstop.
+- GPU.ai's docs describe `--image` and `--auto-terminate-hours` on `gpu
+  instances create`, but the released CLI (v1.3, also the Homebrew stable) does
+  not implement them. The REST API does, so `gpu_batch.py` uses REST for
+  creation and the CLI for SSH, pricing, and teardown.
