@@ -46,6 +46,38 @@ repo is already on the instance.
 gpu instances ssh <instance-id> -- 'tar -C /root/YuE2 -cf - runs' | tar -xf -
 ```
 
+## Seed sweeps (batch)
+
+To test variation, render N seeds per request. `tools/expand_seeds.py` turns each
+request into N rows with a unique `<id>_seed<seed>` and records the seed, and
+`tools/gpu_batch.py` drives the whole cycle — stage, upload, batch, download,
+terminate:
+
+```bash
+# create a fresh instance, render 4 seeds, pull results, tear down
+tools/gpu_batch.py --request examples/song.json --seeds 4 --create
+
+# reuse a running instance (kept alive unless --terminate)
+tools/gpu_batch.py --request song-packs/my-song --seeds 4 --instance <instance-id>
+
+# inspect the plan without spending anything
+tools/gpu_batch.py --request examples/song.json --seeds 4 --create --dry-run
+```
+
+`--request` accepts a file or a directory (repeatable); a directory's request
+JSONs are all expanded, and any `abc_path` files are copied into a self-contained
+pack. Results land in `runs/<slug>/<id>_seed<seed>/`, each with the seed in
+`request.json` and `result.json`. `--keep` leaves the instance running;
+`--terminate` tears down one that was passed with `--instance`.
+
+The lower-level pieces are reusable on their own:
+
+```bash
+tools/expand_seeds.py song-packs --seeds 4 --seed-start 831001 --stage /tmp/pack
+gpu instances ssh <id> -- 'cd /root/YuE2 && HF_HOME=$PWD/.hf-cache \
+  .venv/bin/yue2 batch --input packs/<slug>/batch.jsonl --output runs/batch'
+```
+
 ## Stop paying
 
 ```bash
