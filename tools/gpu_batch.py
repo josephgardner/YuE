@@ -68,6 +68,42 @@ def gpu_json(args):
     return json.loads(out)
 
 
+def gpu_json_soft(args):
+    """Like gpu_json but returns None instead of exiting when the call fails."""
+    result = subprocess.run(["gpu", *args, "-o", "json"], text=True, capture_output=True)
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+
+
+def report_spend_limit():
+    data = gpu_json_soft(["spend-limit"])
+    if data is None:
+        log("no GPU.ai spending limit configured — set a backstop so a crashed run "
+            "cannot bill indefinitely:")
+        log("  gpu spend-limit --monthly 50 --daily 10")
+        return None
+    log(f"spend limit: {json.dumps(data)}")
+    return data
+
+
+def report_strays():
+    instances = gpu_json_soft(["instances", "list"]) or []
+    active = [i for i in instances if i.get("status") not in {"terminated", "deleting"}]
+    if not active:
+        log("no GPU.ai instances left running")
+        return []
+    log(f"{len(active)} instance(s) still not terminated (billing):")
+    for i in active:
+        iid = i.get("id")
+        log(f"  {iid}  {i.get('name', '')}  {i.get('status')}  "
+            f"${i.get('price_per_hour') or 0:.4f}/hr  (gpu instances delete {iid})")
+    return active
+
+
 def slugify(text):
     return re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-") or "pack"
 
@@ -171,6 +207,8 @@ def main(argv=None):
     if not args.instance and not args.create:
         raise SystemExit("pass --instance <id> or --create")
 
+    report_spend_limit()
+
     stage = Path(tempfile.mkdtemp(prefix="yue2-pack-"))
     report = build_manifest(args.request, args.seeds, args.seed_start, stage=stage)
     first_id = json.loads(Path(report["output"]).read_text().splitlines()[0])["id"].rsplit("_seed", 1)[0]
@@ -215,6 +253,7 @@ def main(argv=None):
         if created and not args.dry_run:
             log(f"FAILED — {iid} is still running and billing. Stop it with:")
             log(f"  gpu instances delete {iid}")
+        report_strays()
         raise
 
     should_terminate = (created or args.terminate) and not args.keep
@@ -224,6 +263,7 @@ def main(argv=None):
     else:
         log(f"leaving {iid} running (use --terminate/--keep to change)")
 
+    strays = report_strays()
     print(json.dumps({
         "instance": iid,
         "created": created,
@@ -232,6 +272,7 @@ def main(argv=None):
         "rows": report["rows"],
         "manifest": report["output"],
         "results": str(download_dir),
+        "strays": [s.get("id") for s in strays],
     }, indent=2))
     return 0
 

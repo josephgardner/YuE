@@ -85,6 +85,23 @@ gpu instances delete <instance-id>
 gpu instances list -o json          # verify nothing is still running
 ```
 
+## Guardrails
+
+GPUs bill until terminated, and a crashed script does not stop the meter.
+`gpu_batch.py` prints the current spending limit up front and re-lists
+instances at the end (and on failure), reporting anything still running, but
+the durable backstop lives on the server:
+
+```bash
+gpu spend-limit --monthly 50 --daily 10    # requires org-admin
+gpu spend-limit -o json                    # show limit and month/day spend
+```
+
+The daily cap is what saves you from an orphaned instance during an unattended
+run; the monthly limit is the outer bound. `--auto-terminate-hours` on
+`gpu instances create` would be the ideal per-run backstop, but it is not in
+the current CLI release (see Notes).
+
 ## Notes
 
 - The certified PyTorch environment ships torch 2.11, while `pyproject.toml`
@@ -93,3 +110,8 @@ gpu instances list -o json          # verify nothing is still running
   `pip install .` path when exact 2.10 reproducibility matters.
 - Model weights (~7.3 GB) download to `$HF_HOME` (`.hf-cache/`) on first
   generation. They do not survive instance deletion.
+- GPU.ai's docs describe `--image` (bring your own container), `--env`,
+  `--port`, and `--auto-terminate-hours` on `gpu instances create`, but the
+  current CLI release (v1.3, also the Homebrew stable) does not implement them.
+  Until that ships, the certified PyTorch environment is the reproducible path,
+  and spend limits are the only server-side backstop.
