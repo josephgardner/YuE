@@ -126,6 +126,63 @@ limit or pull-time guarantee, so start with a **thin image** (CUDA + Python +
 YuE2 + deps, no weights) and let the ~7.3 GB of weights download per instance;
 only bake weights in if measured cold starts show host-side layer reuse.
 
+## Handing a run to another agent
+
+When another agent is going to render a prepared song, give it a brief like the
+one below. The essentials are: the exact tool, the no-spend dry run, the
+requirement to show the price and wait for an explicit yes before creating, and
+the truncation check.
+
+```
+You're running a YuE2 seed sweep on a GPU.ai instance. Work in the YuE2 repo.
+
+Goal: render <N> seeds of the prepared song <request.json or pack directory>
+and download the audio.
+
+Tools (already in the repo):
+- tools/gpu_batch.py    stages the pack, creates the instance, deploys, runs
+                        `yue2 batch`, downloads results, terminates.
+- tools/expand_seeds.py expands a request into one row per seed, with a unique
+                        id `<id>_seed<seed>` and the seed recorded.
+- docs/gpu-ai.md        the full workflow.
+
+Prereqs: the `gpu` CLI is installed and authenticated (GPUAI_API_KEY is in the
+repo .env; gpu_batch.py reads it) and an SSH key is registered.
+
+Steps:
+1. Validate staging with no spend:
+     tools/gpu_batch.py --request <path> --seeds <N> --create --dry-run
+2. Money guardrail - do not skip: show the exact POST /instances JSON body and
+   the hourly price the script printed, then WAIT for an explicit "yes". A
+   blanket "go ahead" is not confirmation.
+3. Run it:
+     tools/gpu_batch.py --request <path> --seeds <N> --create
+   It creates via REST with a 2-hour server-side auto-terminate, deletes the
+   instance at the end, and reports any stray instances.
+4. Report back: instance id, seeds rendered, the local results directory, and
+   whether any result.json has "truncated": true.
+
+Do not: commit, push, edit pyproject.toml, pass --keep, or auto-retry a failed
+create. If the create fails, stop and report the error.
+
+Results land in runs/<slug>/<id>_seed<seed>/ (audio.flac, score.abc,
+request.json, result.json). Each result.json holds the seed and timing.
+
+If REST create fails, create manually and reuse the instance:
+  gpu instances create --type rtx_a6000 --environment certified:pytorch@2.11 \
+    --count 1 --tier on_demand --ssh-key-id <key-id> --name yue2-render
+  tools/gpu_batch.py --request <path> --seeds <N> --instance <id> --terminate
+```
+
+Two values to pin down before sending: the seed count (and whether the default
+`--seed-start 831001` is fine), and whether the input is a single request JSON
+or a directory. Prefer a directory when the request has an `abc_path` —
+`expand_seeds.py` copies the ABC into the staged pack automatically.
+
+Long songs need a high enough `semantic_sampling.max_tokens` in the request
+(e.g. 14000). If `result.json` shows `truncated.semantic: true`, the take was
+cut short; raise it and re-render rather than accepting it.
+
 ## Notes
 
 - The certified PyTorch environment ships torch 2.11, while `pyproject.toml`
